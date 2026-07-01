@@ -1,61 +1,7 @@
-﻿"""
-=============================================================================
-scripts/query.py — Terminal RAG with intent-driven hard filtering (v6.1)
-=============================================================================
 
-WHAT CHANGED vs v6
-------------------
-v6 pushed an intent filter into Qdrant. Two problems showed up in the
-golden-dataset run:
-
-  (A) The 3B model could not execute the conditional prompt rules. It
-      emitted "I could not find that information..." AND then answered,
-      and once leaked the literal placeholder "<jurisdiction>".
-  (B) In loose mode the single top-40 retrieval let IEC chunks (closer
-      in embedding space) starve ALL pt_legislation chunks, even when
-      the jurisdiction filter was correct.
-  (C) Real engineering questions ("select the cross-section of MV
-      cables") triggered no intent at all and drifted to handbooks.
-
-v6.1 fixes:
-
-  A. Single-rule prompt. No conditional self-diagnosis. The system
-     already knows what it retrieved; the model just answers or gives
-     ONE refusal sentence. No <placeholder> tokens.
-
-  B. Dual-pass quota retrieval for jurisdiction questions. One pass
-     retrieves ONLY the jurisdiction (guarantees legislation chunks),
-     a second pass retrieves ONLY iec_standard (supporting normative
-     context). Merge + dedupe. Neither side can starve the other.
-
-  C. Engineering-sizing lexicon added to detect_intent so cable /
-     ampacity / earthing questions prioritise normative sources.
-
-  + New --model flag to switch the generation model (e.g. 14B) for
-    the 3B-vs-14B benchmark, without editing the file.
-
-PIPELINE
---------
-    1. Detect intent (PT / BR / HR / EU / IEC number / sizing terms).
-    2. If jurisdiction intent  -> DUAL-PASS QUOTA retrieval.
-       Else                    -> single filtered retrieval (as v6).
-    3. If too few chunks       -> warn + retry without filter.
-    4. Boost IEC chunks whose filename matches the requested number.
-    5. Top rerank_in candidates -> BGE-v2-m3 reranker -> top-N.
-    6. Grouped context -> single-rule prompt -> generation model.
-
-CLI
----
-    python scripts\\query.py "..."                       # default (3B)
-    python scripts\\query.py "..." --no-filter           # v4 behaviour
-    python scripts\\query.py "..." --strict              # only target juris
-    python scripts\\query.py "..." --min-after-filter 8  # higher threshold
-    python scripts\\query.py "..." --debug               # full audit
-=============================================================================
-"""
 
 # =============================================================================
-# IMPORTS
+# IMPORTAÇÕES
 # =============================================================================
 import sys, os, re, time, argparse, warnings, logging
 from pathlib import Path
@@ -86,7 +32,7 @@ from qdrant_client import QdrantClient
 
 
 # =============================================================================
-# ENCODING REPAIRS
+# REPARAÇÃO DE CODIFICAÇÃO
 # =============================================================================
 ENCODING_FIXES = [
     ('\u221eC', '\u00b0C'),
@@ -99,7 +45,7 @@ def fix_encoding(text: str) -> str:
 
 
 # =============================================================================
-# INTENT DETECTION
+# DETEÇÃO DE INTENÇÃO
 # =============================================================================
 def detect_intent(query: str) -> dict:
     q = query.lower()
@@ -107,7 +53,7 @@ def detect_intent(query: str) -> dict:
     priority_jurisdictions = []
     notes                  = []
 
-    # IEC + number capture
+    # Captura de IEC + número
     iec_match  = re.search(r'\biec\s*(\d{3,5})\b', q)
     iec_number = iec_match.group(1) if iec_match else None
     if iec_match:
@@ -124,14 +70,14 @@ def detect_intent(query: str) -> dict:
         notes.append("Question is about standards generally. "
                      "Prioritize normative source types.")
 
-    # ---- (C) Engineering-sizing questions imply normative content ----
-    # These questions ("select the cross-section of MV cables", "ampacity",
-    # "burial depth", "trefoil"...) almost never say "IEC" or "standard",
-    # so without this they trigger no intent and drift to handbooks.
-    # NOTE (thesis trade-off): for a pure sizing question with NO
-    # jurisdiction this routes to the iec_only branch, which excludes
-    # documents like IEEE 80. Acceptable for cable sizing; documented as
-    # a known limitation of keyword-based intent.
+    # ---- (C) Perguntas de dimensionamento implicam conteúdo normativo ----
+    # Estas perguntas ("select the cross-section of MV cables", "ampacity",
+    # "burial depth", "trefoil"...) quase nunca dizem "IEC" nem "standard",
+    # pelo que sem isto não acionam nenhuma intenção e derivam para handbooks.
+    # NOTA (compromisso da tese): para uma pergunta de dimensionamento puro SEM
+    # jurisdição, isto encaminha para o ramo iec_only, que exclui documentos
+    # como a IEEE 80. Aceitável para dimensionamento de cabos; documentado como
+    # limitação conhecida da intenção baseada em palavras-chave.
     if re.search(
         r'cross[\s\-]?section|ampacity|current[\s\-]?rating|'
         r'\bderating\b|cable\s+sizing|conductor\s+siz|'
@@ -157,7 +103,7 @@ def detect_intent(query: str) -> dict:
         notes.append("Question concerns Portuguese context. Hard-filter to "
                      "jurisdiction=PT (loose: + iec_standard).")
 
-    # Brazil
+    # Brasil
     if re.search(r'\bbrasil\b|brazilian\b|\baneel\b|\bons\b|\bprodist\b', q):
         priority_jurisdictions.append("BR")
         if "br_legislation" not in priority_types:
@@ -165,7 +111,7 @@ def detect_intent(query: str) -> dict:
         notes.append("Question concerns Brazilian context. Hard-filter to "
                      "jurisdiction=BR (loose: + iec_standard).")
 
-    # Croatia
+    # Croácia
     if re.search(r'croat\w+|\bhrvatska\b|narodne\s+novine|\bhera\b', q):
         priority_jurisdictions.append("HR")
         if "hr_legislation" not in priority_types:
@@ -173,7 +119,7 @@ def detect_intent(query: str) -> dict:
         notes.append("Question concerns Croatian context. Hard-filter to "
                      "jurisdiction=HR (loose: + iec_standard).")
 
-    # EU
+    # UE
     if re.search(
         r'\beu\b|european\s+union|european\s+commission|'
         r'directiva|directive|regulamento\s+eu|\brfg\b',
@@ -185,7 +131,7 @@ def detect_intent(query: str) -> dict:
         notes.append("Question concerns EU context. Hard-filter to "
                      "jurisdiction=EU (loose: + iec_standard).")
 
-    # Book / handbook
+    # Livro / handbook
     if re.search(r'\bbook\b|\bhandbook\b|\btextbook\b|livro\b', q):
         if "book" not in priority_types:
             priority_types.append("book")
@@ -201,12 +147,12 @@ def detect_intent(query: str) -> dict:
 
 
 # =============================================================================
-# INTENT → QDRANT METADATA FILTER  (used for NON-quota paths)
+# INTENÇÃO → FILTRO DE METADADOS QDRANT  (usado nos caminhos SEM quota)
 # =============================================================================
 def build_intent_filter(intent: dict, strict: bool):
     """
-    Translate intent into a LlamaIndex MetadataFilters object that Qdrant
-    evaluates server-side. Returns (filter_or_None, description_str).
+    Traduz a intenção num objeto MetadataFilters do LlamaIndex que o Qdrant
+    avalia no lado do servidor. Devolve (filtro_ou_None, string_descrição).
     """
     juris_list = intent.get("priority_jurisdictions") or []
     types_list = intent.get("priority_types") or []
@@ -236,7 +182,7 @@ def build_intent_filter(intent: dict, strict: bool):
                 desc,
             )
 
-        # Loose: jurisdictions OR iec_standard
+        # Loose: jurisdições OR iec_standard
         iec_filter = MetadataFilter(
             key="source_type", value="iec_standard",
             operator=FilterOperator.EQ,
@@ -250,7 +196,7 @@ def build_intent_filter(intent: dict, strict: bool):
             desc,
         )
 
-    # iec_only branch
+    # ramo iec_only
     desc = "source_type == iec_standard"
     return (
         MetadataFilters(
@@ -265,16 +211,16 @@ def build_intent_filter(intent: dict, strict: bool):
 
 
 # =============================================================================
-# IEC NUMBER SCORE ADJUSTMENT (post-filter)
+# AJUSTE DE PONTUAÇÃO POR NÚMERO IEC (pós-filtro)
 # =============================================================================
 def adjust_iec_scores(nodes, iec_number, boost: float, penalty: float,
                       verbose: bool = False):
     """
-    When the query mentions a specific IEC number (e.g. "60287"):
-      - Boost  iec_standard chunks whose filename contains that number.
-      - Penalise iec_standard chunks whose filename contains a different
-        4-5 digit IEC family number.
-      - Non-IEC chunks untouched.
+    Quando a pergunta menciona um número IEC específico (ex. "60287"):
+      - Reforça os chunks iec_standard cujo nome de ficheiro contém esse número.
+      - Penaliza os chunks iec_standard cujo nome de ficheiro contém um número
+        de família IEC diferente (4-5 dígitos).
+      - Os chunks não-IEC ficam intactos.
     """
     if not iec_number:
         return nodes
@@ -294,8 +240,8 @@ def adjust_iec_scores(nodes, iec_number, boost: float, penalty: float,
             delta += boost
             reasons.append(f"+{boost:.2f}/IEC_match={iec_number}")
         else:
-            # Look for any 4-5 digit IEC family number in the filename;
-            # if a *different* one is present, penalise.
+            # Procurar qualquer número de família IEC (4-5 dígitos) no nome do
+            # ficheiro; se estiver presente um *diferente*, penalizar.
             other = re.search(r'\b(\d{4,5})\b', fname)
             if other and other.group(1) != iec_number:
                 delta -= penalty
@@ -316,7 +262,7 @@ def adjust_iec_scores(nodes, iec_number, boost: float, penalty: float,
 
 
 # =============================================================================
-# CONTEXT GROUPING
+# AGRUPAMENTO DE CONTEXTO
 # =============================================================================
 def build_grouped_context(reranked) -> str:
     grouped = defaultdict(list)
@@ -343,7 +289,7 @@ def build_grouped_context(reranked) -> str:
 
 
 # =============================================================================
-# PROMPT TEMPLATE  — (A) single-rule, no conditional self-diagnosis
+# MODELO DE PROMPT  — (A) regra única, sem autodiagnóstico condicional
 # =============================================================================
 PROMPT_TEMPLATE = """You are a technical assistant for wind farm electrical \
 engineering, standards, and cable sizing. Always answer in English, whatever \
@@ -390,7 +336,7 @@ ANSWER:"""
 
 
 def format_intent_hints(intent: dict) -> str:
-    """Kept for --debug printing only; no longer injected into the prompt."""
+    """Mantido apenas para impressão com --debug; já não é injetado no prompt."""
     if not intent["notes"]:
         return ("  (no specific intent detected — answering from all "
                 "available sources, grouped by type)")
@@ -448,7 +394,7 @@ def parse_args():
 
 
 # =============================================================================
-# RETRIEVAL HELPERS
+# AUXILIARES DE RECUPERAÇÃO
 # =============================================================================
 def retrieve_with_filter(index, query, top_k, filters, label=""):
     t0 = time.time()
@@ -464,21 +410,22 @@ def retrieve_with_filter(index, query, top_k, filters, label=""):
 
 def retrieve_with_quota(index, query, intent, args):
     """
-    (B) Jurisdiction question: TWO retrievals, then RESERVED SLOTS in the
-    rerank pool so neither side can starve the other.
+    (B) Pergunta com jurisdição: DUAS recuperações e depois SLOTS RESERVADOS no
+    conjunto de rerank, para que nenhum dos lados esfomeie o outro.
 
-    v6.1 BUG (fixed here): the merge re-sorted everything by raw embedding
-    score. PT legislation scores lower than IEC standards in embedding
-    space for technical queries, so every PT chunk was truncated by
-    nodes[:rerank_in] BEFORE the cross-encoder ever saw it. The dual-pass
-    retrieval was pointless because the merge threw the PT side away.
+    BUG v6.1 (corrigido aqui): a fusão reordenava tudo pela pontuação de
+    embedding em bruto. A legislação PT pontua mais baixo do que as normas IEC
+    no espaço de embedding para perguntas técnicas, pelo que todos os chunks PT
+    eram truncados por nodes[:rerank_in] ANTES de o cross-encoder os ver sequer.
+    A recuperação em duas passagens era inútil porque a fusão deitava fora o
+    lado PT.
 
-    Fix: do NOT re-sort the union by score. Reserve the first rerank_in
-    slots — half guaranteed to the jurisdiction pass, half to
-    iec_standard — keeping each pass in its own Qdrant score order. The
-    cross-encoder then judges actual relevance on a pool that is
-    guaranteed to CONTAIN jurisdiction candidates. Leftovers follow,
-    score-sorted, only as fallback backfill.
+    Correção: NÃO reordenar a união pela pontuação. Reservar os primeiros
+    rerank_in slots — metade garantida à passagem da jurisdição, metade a
+    iec_standard — mantendo cada passagem na sua própria ordem de pontuação do
+    Qdrant. O cross-encoder avalia então a relevância real num conjunto que
+    garantidamente CONTÉM candidatos da jurisdição. Os restantes seguem,
+    ordenados por pontuação, apenas como preenchimento de reserva.
     """
     juris_list = intent.get("priority_jurisdictions") or []
 
@@ -506,8 +453,8 @@ def retrieve_with_quota(index, query, intent, args):
         label="iec pass"
     )
 
-    # Dedupe across passes, preserving each pass's own Qdrant order
-    # (a chunk seen in the jurisdiction pass is not repeated in IEC).
+    # Desduplicar entre passagens, preservando a ordem Qdrant de cada passagem
+    # (um chunk visto na passagem da jurisdição não se repete no IEC).
     seen = set()
     def _dedupe(lst):
         out = []
@@ -521,15 +468,15 @@ def retrieve_with_quota(index, query, intent, args):
     juris_nodes = _dedupe(juris_nodes)
     iec_nodes   = _dedupe(iec_nodes)
 
-    # Reserved split for the rerank pool: half jurisdiction, half IEC.
+    # Divisão reservada para o conjunto de rerank: metade jurisdição, metade IEC.
     cap     = args.rerank_in
     j_quota = max(1, cap // 2)
     i_quota = cap - j_quota
 
     head = juris_nodes[:j_quota] + iec_nodes[:i_quota]
 
-    # If one side was short, backfill the head from whatever remains so
-    # the rerank pool is still full.
+    # Se um dos lados ficou curto, preencher a cabeça com o que sobra para o
+    # conjunto de rerank continuar cheio.
     if len(head) < cap:
         leftover = juris_nodes[j_quota:] + iec_nodes[i_quota:]
         leftover.sort(key=lambda x: x.score or 0.0, reverse=True)
@@ -561,7 +508,7 @@ def main():
 
     print(f">> Question: {query}", flush=True)
 
-    # ---- Intent ----
+    # ---- Intenção ----
     intent = (
         {"priority_types": [], "priority_jurisdictions": [],
          "iec_number": None, "notes": []}
@@ -581,7 +528,7 @@ def main():
     if args.no_filter:
         print(">> --no-filter: intent-driven filtering DISABLED.")
 
-    # ---- Services ----
+    # ---- Serviços ----
     Settings.embed_model = OllamaEmbedding(
         model_name='bge-m3', base_url='http://localhost:11434'
     )
@@ -606,13 +553,13 @@ def main():
         top_n=args.top_n,
     )
 
-    # ---- Build intent filter (used by NON-quota paths) ----
+    # ---- Construir filtro de intenção (usado nos caminhos SEM quota) ----
     intent_filter = None
     filter_desc   = "no filter"
     if not args.no_filter and not (args.type or args.jurisdiction):
         intent_filter, filter_desc = build_intent_filter(intent, args.strict)
 
-    # CLI overrides become additional filters
+    # Os overrides de CLI tornam-se filtros adicionais
     cli_filters = []
     if args.type:
         cli_filters.append(MetadataFilter(
@@ -630,9 +577,10 @@ def main():
 
     t_start = time.time()
 
-    # ---- 1. Retrieval ----------------------------------------------------
-    # Quota path only for loose jurisdiction questions with no CLI override
-    # and no --strict / --no-filter. Everything else keeps v6 behaviour.
+    # ---- 1. Recuperação ----
+    # Caminho de quota apenas para perguntas de jurisdição em modo loose, sem
+    # override de CLI e sem --strict / --no-filter. Tudo o resto mantém o
+    # comportamento v6.
     use_quota = (
         not args.no_filter
         and not args.strict
@@ -680,21 +628,21 @@ def main():
         print(">> No chunks available — cannot answer.")
         sys.exit(0)
 
-    # ---- 2. Fix encoding + ensure classification ----
+    # ---- 2. Corrigir codificação + garantir classificação ----
     for n in nodes:
         n.node.text = fix_encoding(n.node.text)
         md = n.node.metadata
         if md.get("source_type") in (None, "", "unknown"):
             md.update(classify_source(md.get("file_name", ""), n.node.text))
 
-    # ---- 3. IEC number score adjustment ----
-    # NOTE: adjust_iec_scores() re-sorts the whole list by raw score at
-    # the end. On the quota path the list is already slot-protected
-    # (reserved jurisdiction seats at the head); re-sorting here would
-    # resurrect the v6.1 bug and truncate PT chunks again. So the IEC
-    # boost only runs on NON-quota paths. (Quota fires on jurisdiction
-    # questions; the specific-IEC-number boost targets IEC-number
-    # questions — the two intents rarely coincide, so little is lost.)
+    # ---- 3. Ajuste de pontuação por número IEC ----
+    # NOTA: adjust_iec_scores() reordena a lista inteira pela pontuação em bruto
+    # no fim. No caminho de quota a lista já está protegida por slots (lugares de
+    # jurisdição reservados na cabeça); reordenar aqui ressuscitaria o bug v6.1 e
+    # voltaria a truncar os chunks PT. Por isso o reforço IEC só corre nos
+    # caminhos SEM quota. (A quota dispara em perguntas de jurisdição; o reforço
+    # por número IEC específico visa perguntas de número IEC — as duas intenções
+    # raramente coincidem, pelo que pouco se perde.)
     if intent.get("iec_number") and not args.no_intent and not use_quota:
         print("\n>> Applying IEC-number score adjustments:")
         nodes = adjust_iec_scores(
@@ -707,7 +655,7 @@ def main():
         print("\n>> (IEC-number boost skipped on quota path to preserve "
               "reserved jurisdiction slots.)")
 
-    # ---- 4. Keep top rerank_in ----
+    # ---- 4. Manter os melhores rerank_in ----
     pre_rerank = nodes[: args.rerank_in]
     print(f"\n>> Top {len(pre_rerank)} candidates entering reranker:")
     for i, n in enumerate(pre_rerank, 1):
@@ -747,12 +695,12 @@ def main():
             print(n.node.get_content())
 
     # ---- 6. Prompt + LLM ----
-    # Confidence tier from top rerank score. Thresholds calibrated against
-    # empirical golden-dataset runs: vague PT queries with the correct
-    # documents in the top-5 typically score 0.10-0.20 at rerank top-1
-    # (e.g. Manual de Ligacoes p.7 on the "niveis de tensao" question
-    # scored 0.150). Treating those as LOW caused blanket refusals; they
-    # are MEDIUM and the answer should be partial-with-caveat.
+    # Nível de confiança a partir da pontuação de rerank do topo. Limiares
+    # calibrados com execuções empíricas do golden dataset: perguntas PT vagas
+    # com os documentos corretos no top-5 pontuam tipicamente 0.10-0.20 no
+    # rerank top-1 (ex. o Manual de Ligações p.7 na pergunta dos "níveis de
+    # tensão" pontuou 0.150). Tratá-las como LOW causava recusas generalizadas;
+    # são MEDIUM e a resposta deve ser parcial-com-ressalva.
     top_rerank = reranked[0].score if reranked else 0.0
     if top_rerank >= 0.40:
         retrieval_confidence = "HIGH"
@@ -785,7 +733,7 @@ def main():
     print(f">> Answer (LLM {elapsed:.1f}s, total {total:.1f}s):")
     print(str(resp))
 
-    # ---- Summary ----
+    # ---- Resumo ----
     top_score   = reranked[0].score if reranked else 0
     type_counts = defaultdict(int)
     jur_counts  = defaultdict(int)
@@ -802,10 +750,10 @@ def main():
           ", ".join(f"{k}={v}" for k, v in type_counts.items()))
     print("   jurisdictions:  " +
           ", ".join(f"{k}={v}" for k, v in jur_counts.items()))
-    # NOTE: rerank score measures embedding proximity, NOT answer
-    # faithfulness. The tier label here is the SAME tier passed to the
-    # prompt (thresholds 0.08 / 0.40), so the >> Retrieval confidence
-    # tier line and this line always agree.
+    # NOTA: a pontuação de rerank mede proximidade de embedding, NÃO a fidelidade
+    # da resposta. O rótulo de nível aqui é o MESMO nível passado ao prompt
+    # (limiares 0.08 / 0.40), pelo que a linha ">> Retrieval confidence tier" e
+    # esta linha concordam sempre.
     if retrieval_confidence == "LOW":
         print("   [!] Low retrieval confidence "
               "(prompt instructed model to refuse).")
