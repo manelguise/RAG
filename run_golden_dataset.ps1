@@ -1,67 +1,31 @@
 # =============================================================================
-# run_golden_dataset.ps1 — Batch the 40-question evaluation AS the A6 agent
+# run_golden_dataset.ps1 — Avaliacao das 40 perguntas no papel do Agente A6
 # =============================================================================
 # Avalia a RAG no papel do Agente A6 (Apoio Regulatorio e Licenciamento):
 #   - injeta a persona do A6 no system prompt da geracao (--system-prompt)
 #   - mede sinais proprios do A6: presenca de citacao e abstencao em baixa
 #     confianca (a salvaguarda de mitigacao de alucinacoes)
 #   - regista, por pergunta, o agente que a consultaria no servico transversal
-#
-# Usage (from C:\Users\manel\rag-local with .venv activated):
-#     .\scripts\run_golden_dataset.ps1
-#     .\scripts\run_golden_dataset.ps1 -Model qwen2.5:14b
-#     .\scripts\run_golden_dataset.ps1 -OnlySections A,D,G
-#     .\scripts\run_golden_dataset.ps1 -NoIndividual      # only the consolidated MD
-#     .\scripts\run_golden_dataset.ps1 -NoAgentPrompt     # corre a RAG "crua" (baseline A/B)
-#     .\scripts\run_golden_dataset.ps1 -NoTxt             # nao escrever o relatorio .txt
-#
-# Outputs to: evals\a6_<timestamp>\
-#     all_answers.md         (consolidated Markdown of every question + answer)
-#     a6_report.txt          (plain-text report of every question + answer)
-#     manifest.csv           (one row per question, for Excel analysis)
-#     Q01_A_topologias.txt   (individual outputs — unless -NoIndividual)
-#     ...
-#
-# >>> INTEGRACAO COM query.py <<<
-# Para a persona do A6 ser aplicada, o query.py tem de aceitar:
-#     --system-prompt <ficheiro>
-# e usar o conteudo desse ficheiro como mensagem 'system' enviada ao LLM.
-# Se a flag nao existir, o script DETETA-O, avisa, e corre sem a persona
-# (equivalente ao golden dataset original). Excerto a acrescentar ao query.py:
-#
-#     ap.add_argument("--system-prompt", type=str, default=None,
-#                     help="Ficheiro com o system prompt do agente.")
-#     ...
-#     system_msg = DEFAULT_SYSTEM_PROMPT
-#     if args.system_prompt:
-#         with open(args.system_prompt, encoding="utf-8") as fh:
-#             system_msg = fh.read()
-#     # passar system_msg como role=system na chamada ao Ollama chat
 # =============================================================================
-
 param(
     [string]   $Model         = "qwen2.5:3b-instruct-q4_K_M",
     [string[]] $OnlySections  = @(),
     [int]      $SleepBetween  = 5,
     [string]   $A6PromptPath  = "evals\a6_system_prompt.txt",
-    [switch]   $NoIndividual,                               # only the consolidated MD
+    [switch]   $NoIndividual,                               # so o MD consolidado
     [switch]   $NoAgentPrompt,                              # correr sem a persona do A6
     [switch]   $NoTxt                                       # nao escrever o relatorio .txt
 )
-
 $Model = $Model.Trim()   # defensivo: um espaco a mais quebra o Ollama model lookup
-
-# ---- Force UTF-8 for Python stdout/stderr in Windows ----------------------
-# Without these, characters like a (U+0303 combining tilde), >= (U+2265),
-# deg (U+00B0) crash print() in Python with UnicodeEncodeError under PowerShell.
-# Approx. 22% of answers were lost to this in earlier runs.
+# ---- Forcar UTF-8 no stdout/stderr do Python em Windows -------------------
+# Sem isto, caracteres como o til combinante (U+0303), >= (U+2265) ou o grau
+# (U+00B0) rebentam o print() do Python com UnicodeEncodeError no PowerShell.
+# Cerca de 22% das respostas perderam-se por isto em corridas anteriores.
 $env:PYTHONIOENCODING = "utf-8"
 $env:PYTHONUTF8       = "1"
-
-# ---- Plain-text report toggle ---------------------------------------------
+# ---- Ativar/desativar o relatorio em texto simples ------------------------
 $writeTxt = -not $NoTxt
-
-# ---- Sanity checks --------------------------------------------------------
+# ---- Verificacoes de sanidade ---------------------------------------------
 $venvPython = ".\.venv\Scripts\python.exe"
 if (-not (Test-Path $venvPython)) {
     Write-Host "[error] $venvPython not found. Activate the venv first." `
@@ -85,7 +49,6 @@ try {
     Write-Host "[error] Qdrant not reachable on :6333." -ForegroundColor Red
     exit 1
 }
-
 # ---- Persona do Agente A6 -------------------------------------------------
 # Escrita para ficheiro se ainda nao existir; podes edita-la a vontade depois.
 # Reflete o papel do A6 no capitulo: corpus duplo (legislacao publica + dossie
@@ -98,7 +61,6 @@ multiagente de apoio ao projeto de parques eolicos. A tua funcao e instruir e
 verificar materia regulatoria e de licenciamento com base no corpus disponivel:
 legislacao nacional e europeia, normas tecnicas (IEC, IEEE, EN), manuais dos
 operadores de rede (REN, E-REDES) e o dossie tecnico do projeto.
-
 Regras de funcionamento:
 1. Responde exclusivamente com base nas passagens recuperadas. Nao inventes
    requisitos, valores, prazos ou referencias que nao constem do contexto.
@@ -113,14 +75,12 @@ Regras de funcionamento:
    explicita, em vez de especular. E preferivel assumir a ausencia de fundamento
    a produzir uma resposta plausivel mas nao verificavel.
 6. Escreve em portugues europeu, com registo tecnico e objetivo.
-
 Estrutura a resposta em duas partes: primeiro a resposta fundamentada; depois,
 sob o titulo "Fontes", a lista das referencias efetivamente utilizadas.
 '@
     $a6Prompt | Out-File -Encoding utf8 $A6PromptPath
     Write-Host "[a6] system prompt criado em $A6PromptPath"
 }
-
 # ---- Deteta suporte a --system-prompt no query.py -------------------------
 $useSystemPrompt = $false
 if (-not $NoAgentPrompt) {
@@ -141,15 +101,13 @@ if (-not $NoAgentPrompt) {
     Write-Host "[a6] -NoAgentPrompt: a correr a RAG crua (baseline)." `
         -ForegroundColor Yellow
 }
-
-# ---- Section -> agente que consulta o servico transversal -----------------
+# ---- Seccao -> agente que consulta o servico transversal ------------------
 # A6 responde sempre; esta coluna regista de que agente a consulta proviria no
 # papel de servico transversal de consulta normativa (ver Tabela do capitulo).
 $agentMap = @{
     "A" = "A6";  "B" = "A6";  "C" = "A6";  "D" = "A6"
     "E" = "A8";  "F" = "A6";  "G" = "A12"; "H" = "A12"
 }
-
 # ---- Heuristicas de avaliacao A6 ------------------------------------------
 # cites_source: a resposta invoca uma fonte concreta? (presenca, nao exatidao)
 $citePattern = 'DL\s*\d|Decreto-Lei|Portaria|Despacho|Diretiva|Regulamento|' +
@@ -160,8 +118,7 @@ $abstainPattern = 'nao foi|nao foram|nao e possivel|nao consta|nao disponho|' +
                   'nao ha|corpus nao|sem fundamento|nao recuperad|nao encontrad|' +
                   'ausencia de fundamento|nao permite|' +
                   'não foi|não foram|não é possível|não consta|não há|sem fundamento'
-
-# ---- The 40 questions, grouped by section (A6 regulatory matters) ----------
+# ---- As 40 perguntas, agrupadas por seccao (materias regulatorias do A6) ---
 # Cada seccao e uma materia regulatoria do ambito do agente A6 (Apoio
 # Regulatorio e Licenciamento), alinhada com o catalogo do Cap. 2 e o
 # faseamento do Cap. 4. Todas tem resposta na legislacao/normas publicas
@@ -185,7 +142,6 @@ $questions = @(
       "Que diploma nacional parametriza para Portugal os requisitos de ligacao do RfG aplicaveis aos modulos geradores?"),
     @("A","categorias_tipo_A_a_D",
       "Como se distinguem as categorias de modulos geradores do Tipo A ao Tipo D no codigo de rede europeu?"),
-
     @("B","titulo_reserva_capacidade",
       "Que titulo habilita a reserva de capacidade de injecao na RESP e ao abrigo de que regime e emitido?"),
     @("B","dl15_2022_regime_renovaveis",
@@ -196,7 +152,6 @@ $questions = @(
       "Que instrumento regulatorio permite a injecao de potencia ativa sujeita a restricoes temporarias e que entidade o aprovou?"),
     @("B","entidade_competente_reserva",
       "Que entidade e competente para a atribuicao do Titulo de Reserva de Capacidade no quadro do regime de acesso a rede?"),
-
     @("C","licenca_producao_ato_entidade",
       "Que ato habilita a exploracao de um centro electroprodutor e que entidade o emite?"),
     @("C","fases_licenciamento_producao",
@@ -207,7 +162,6 @@ $questions = @(
       "Que competencias detem a DGEG no licenciamento de centros electroprodutores?"),
     @("C","pecas_tecnicas_pedido_licenca",
       "Que pecas tecnicas instruem o pedido de licenca de producao de um parque eolico?"),
-
     @("D","aia_condicoes_sujeicao",
       "Em que condicoes um parque eolico fica sujeito a procedimento de Avaliacao de Impacte Ambiental em Portugal?"),
     @("D","dia_natureza_efeitos",
@@ -218,7 +172,6 @@ $questions = @(
       "Que entidade coordena o procedimento de AIA e a emissao da DIA?"),
     @("D","regime_juridico_aia",
       "Que diploma estabelece o regime juridico da Avaliacao de Impacte Ambiental aplicavel a parques eolicos?"),
-
     @("E","frt_suportabilidade_cavas",
       "Que requisito de suportabilidade a cavas de tensao (Fault Ride Through) se aplica aos modulos Tipo D e onde esta parametrizado?"),
     @("E","capacidade_reativa_curvas_PQ",
@@ -229,7 +182,6 @@ $questions = @(
       "Quais as gamas de frequencia e de tensao em que um modulo Tipo D tem de permanecer ligado a rede?"),
     @("E","conformidade_rfg_ensaios_ren",
       "Que processo de verificacao de conformidade com o RfG e conduzido pela REN para um novo modulo gerador?"),
-
     @("F","termo_responsabilidade_funcao",
       "Qual a funcao de um Termo de Responsabilidade no dossie de licenciamento de um parque eolico?"),
     @("F","projeto_execucao_conteudo",
@@ -240,7 +192,6 @@ $questions = @(
       "O que motiva tipicamente um pedido de elementos adicionais pelas entidades licenciadoras e como se evita?"),
     @("F","esquema_unifilar_pecas_desenhadas",
       "Que pecas desenhadas, como o esquema unifilar, integram o projeto eletrico submetido a licenciamento?"),
-
     @("G","comunicacao_operacional_provisoria",
       "O que e a comunicacao operacional provisoria e que ensaios a antecedem?"),
     @("G","ensaios_conformidade_ren",
@@ -251,7 +202,6 @@ $questions = @(
       "Que condicoes habilitam a passagem da comunicacao operacional provisoria a definitiva?"),
     @("G","indicadores_disponibilidade_61400_26",
       "Que norma estabelece o modelo normalizado de indicadores de disponibilidade de parques eolicos?"),
-
     @("H","hibrida_ponto_entrega_partilhado",
       "Como e tratado o licenciamento de uma central hibrida que partilha ponto de entrega entre producao eolica e fotovoltaica?"),
     @("H","nis2_transposicao_pt",
@@ -263,15 +213,13 @@ $questions = @(
     @("H","obrigacoes_ciberseguranca_nis2",
       "Que obrigacoes de ciberseguranca recaem sobre os operadores de infraestruturas energeticas criticas ao abrigo da NIS2?")
 )
-
-# ---- Filter by section if requested ---------------------------------------
+# ---- Filtrar por seccao, se pedido ----------------------------------------
 if ($OnlySections.Count -gt 0) {
     $upper = $OnlySections | ForEach-Object { $_.ToUpper() }
     $questions = $questions | Where-Object { $upper -contains $_[0] }
     Write-Host "[filter] running $($questions.Count) questions from sections: $($upper -join ',')"
 }
-
-# ---- Output folder --------------------------------------------------------
+# ---- Pasta de saida -------------------------------------------------------
 $stamp  = Get-Date -Format "yyyyMMdd_HHmmss"
 $outDir = "evals\a6_$stamp"
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
@@ -286,38 +234,30 @@ if ($NoIndividual) {
     Write-Host "[mode]         consolidated MD only (no per-question .txt)"
 }
 Write-Host ""
-
-# ---- Write the consolidated MD header -------------------------------------
+# ---- Escrever o cabecalho do MD consolidado -------------------------------
 $sectionList = if ($OnlySections.Count -gt 0) { $OnlySections -join ', ' } else { 'all' }
 $startedAt   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 $mdHeader = @"
 # Agente A6 - Apoio Regulatorio e Licenciamento - Corrida $stamp
-
 - Model: ``$Model``
 - Persona A6 (system prompt): **$personaState**
 - Sections: $sectionList
 - Questions: $($questions.Count)
 - Started: $startedAt
-
 Avaliacao da RAG no papel do agente A6. Para alem do retrieval/rerank, regista,
 por pergunta: se a resposta invoca uma fonte concreta (``cites_source``), se
 assume ausencia de fundamento (``abstained``) e de que agente proviria a
 consulta no servico transversal (``consulting_agent``).
-
 Este documento e escrito apos cada pergunta, pelo que uma corrida que falhe a
 meio mantem aqui tudo o que ja completou.
-
 ---
-
 "@
 $mdHeader | Out-File -Encoding utf8 $consolidated
-
-# ---- Manifest header ------------------------------------------------------
+# ---- Cabecalho do manifest ------------------------------------------------
 $manifest = Join-Path $outDir "manifest.csv"
 "idx,section,consulting_agent,label,elapsed_s,tier,top_rerank,cites_source,abstained,filter_applied,source_types,jurisdictions,output_file" `
     | Out-File -Encoding utf8 $manifest
-
-# ---- Plain-text report: header (written once) -----------------------------
+# ---- Relatorio em texto simples: cabecalho (escrito uma vez) --------------
 $txtReport = Join-Path $outDir "a6_report.txt"
 if ($writeTxt) {
     $hdr = New-Object System.Text.StringBuilder
@@ -338,39 +278,32 @@ if ($writeTxt) {
     $hdr.ToString() | Out-File -Encoding utf8 $txtReport
     Write-Host "[txt]          $txtReport"
 }
-
-# ---- Helper: extract sections from the query.py output --------------------
-# query.py prints in a predictable structure. We isolate four things:
-#   1. The "Top N candidates" block (already nicely aligned)
-#   2. The "Final sources after reranker" block
-#   3. The "Retrieval confidence tier" line
-#   4. The actual answer (between ">> Answer (...):" and ">> Retrieval summary:")
+# ---- Auxiliar: extrair seccoes do output do query.py ----------------------
+# O query.py imprime numa estrutura previsivel. Isolamos quatro coisas:
+#   1. O bloco "Top N candidates" (ja bem alinhado)
+#   2. O bloco "Final sources after reranker"
+#   3. A linha "Retrieval confidence tier"
+#   4. A propria resposta (entre ">> Answer (...):" e ">> Retrieval summary:")
 function Get-OutputSections {
     param([string]$Text)
-
     $top12 = ""
     $final = ""
     $answer = ""
     $tier = ""
-
     if ($Text -match '(?ms)^>> Top \d+ candidates entering reranker:\s*\r?\n(.+?)\r?\n\s*\r?\n>> Reranking') {
         $top12 = $matches[1].Trim()
     }
-
     if ($Text -match '(?ms)^>> Final sources after reranker:\s*\r?\n(.+?)\r?\n\s*\r?\n>>') {
         $final = $matches[1].Trim()
     }
-
     if ($Text -match '>> Retrieval confidence tier:\s*(\w+)\s*\(top rerank = ([\d\.]+)\)') {
         $tier = "$($matches[1]) (rerank=$($matches[2]))"
     }
-
     if ($Text -match '(?ms)>> Answer \([^)]*\):\s*\r?\n(.+?)\r?\n\s*\r?\n>> Retrieval summary:') {
         $answer = $matches[1].Trim()
     } elseif ($Text -match '(?ms)>> Answer \([^)]*\):\s*\r?\n(.+)$') {
         $answer = $matches[1].Trim()
     }
-
     return @{
         Top12  = $top12
         Final  = $final
@@ -378,8 +311,7 @@ function Get-OutputSections {
         Answer = $answer
     }
 }
-
-# ---- Main loop ------------------------------------------------------------
+# ---- Ciclo principal ------------------------------------------------------
 $totalStart = Get-Date
 $idx = 0
 foreach ($q in $questions) {
@@ -390,22 +322,18 @@ foreach ($q in $questions) {
     $idxStr  = "{0:D2}" -f $idx
     $consult = $agentMap[$section]
     $outFile = Join-Path $outDir "Q${idxStr}_${section}_${label}.txt"
-
     Write-Host "[$idxStr/$($questions.Count)] [$section -> $consult] $label" `
         -ForegroundColor Cyan
     Write-Host "    Q: $text"
-
-    # Build query.py invocation (persona via --system-prompt, se suportado)
+    # Construir a invocacao do query.py (persona via --system-prompt, se suportado)
     $qpArgs = @("scripts\query.py", $text, "--model", $Model)
     if ($useSystemPrompt) { $qpArgs += @("--system-prompt", $A6PromptPath) }
-
     $qStart = Get-Date
     $output = & $venvPython @qpArgs 2>&1
     $qEnd   = Get-Date
     $elapsed = [math]::Round(($qEnd - $qStart).TotalSeconds, 1)
     $outText = $output -join "`n"
-
-    # Per-question .txt (unless -NoIndividual)
+    # .txt por pergunta (a menos que -NoIndividual)
     if (-not $NoIndividual) {
         "QUESTION: $text"                       | Out-File -Encoding utf8 $outFile
         "AGENT: A6 (Apoio Regulatorio)"         | Out-File -Encoding utf8 -Append $outFile
@@ -417,30 +345,24 @@ foreach ($q in $questions) {
         ""                                      | Out-File -Encoding utf8 -Append $outFile
         $output                                 | Out-File -Encoding utf8 -Append $outFile
     }
-
-    # Extract structured sections
+    # Extrair seccoes estruturadas
     $parts = Get-OutputSections $outText
-
-    # Manifest metrics
+    # Metricas do manifest
     $filter = if ($outText -match 'filter applied:\s*(.+)') { $matches[1].Trim() } else { "" }
     $topRk  = if ($outText -match 'top rerank score:\s*([\d\.]+)') { $matches[1] } else { "" }
     $types  = if ($outText -match 'source types:\s*(.+)') { $matches[1].Trim() } else { "" }
     $juris  = if ($outText -match 'jurisdictions:\s*(.+)') { $matches[1].Trim() } else { "" }
-
-    # A6-specific signals (heuristicas sobre o texto da resposta)
+    # Sinais especificos do A6 (heuristicas sobre o texto da resposta)
     $cites    = if ($parts.Answer -and ($parts.Answer -match $citePattern))    { "yes" } else { "no" }
     $abstain  = if ($parts.Answer -and ($parts.Answer -match $abstainPattern)) { "yes" } else { "no" }
-
-    # CSV-safe (commas inside fields -> semicolons)
+    # Seguro para CSV (virgulas dentro de campos -> ponto-e-virgula)
     $filterCsv = $filter -replace ',', ';'
     $typesCsv  = $types  -replace ',', ';'
     $jurisCsv  = $juris  -replace ',', ';'
     $tierCsv   = ($parts.Tier -replace ',', ';')
-
     "$idx,$section,$consult,$label,$elapsed,$tierCsv,$topRk,$cites,$abstain,$filterCsv,$typesCsv,$jurisCsv,$(Split-Path -Leaf $outFile)" `
         | Out-File -Encoding utf8 -Append $manifest
-
-    # Build Markdown block for this question
+    # Construir o bloco Markdown desta pergunta
     $md = New-Object System.Text.StringBuilder
     [void]$md.AppendLine("## Q$idxStr - [$section] $label")
     [void]$md.AppendLine("")
@@ -459,7 +381,6 @@ foreach ($q in $questions) {
     [void]$md.AppendLine("| Elapsed          | $elapsed s |")
     [void]$md.AppendLine("| Timestamp        | $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') |")
     [void]$md.AppendLine("")
-
     if ($parts.Top12) {
         [void]$md.AppendLine("**Top candidates (pre-rerank):**")
         [void]$md.AppendLine("")
@@ -468,7 +389,6 @@ foreach ($q in $questions) {
         [void]$md.AppendLine('```')
         [void]$md.AppendLine("")
     }
-
     if ($parts.Final) {
         [void]$md.AppendLine("**Final sources after reranker (top-5):**")
         [void]$md.AppendLine("")
@@ -477,11 +397,10 @@ foreach ($q in $questions) {
         [void]$md.AppendLine('```')
         [void]$md.AppendLine("")
     }
-
     [void]$md.AppendLine("**Answer (A6):**")
     [void]$md.AppendLine("")
     if ($parts.Answer) {
-        # Indent the answer as a blockquote to make it visually distinct.
+        # Indentar a resposta como citacao para a destacar visualmente.
         $answerLines = $parts.Answer -split "`n"
         foreach ($line in $answerLines) {
             [void]$md.AppendLine("> $line")
@@ -492,10 +411,8 @@ foreach ($q in $questions) {
     [void]$md.AppendLine("")
     [void]$md.AppendLine("---")
     [void]$md.AppendLine("")
-
     Add-Content -Path $consolidated -Value $md.ToString() -Encoding utf8
-
-    # ---- Plain-text block for this question (incremental, crash-safe) -----
+    # ---- Bloco em texto simples desta pergunta (incremental, resistente a falhas) ----
     if ($writeTxt) {
         $tb = New-Object System.Text.StringBuilder
         [void]$tb.AppendLine("================================================================================")
@@ -532,11 +449,9 @@ foreach ($q in $questions) {
         [void]$tb.AppendLine("")
         Add-Content -Path $txtReport -Value $tb.ToString() -Encoding utf8
     }
-
     Write-Host "    -> $elapsed s, tier=$($parts.Tier), cites=$cites, abstained=$abstain" `
         -ForegroundColor Green
-
-    # Quick Ollama health check between queries
+    # Verificacao rapida de saude do Ollama entre perguntas
     try {
         Invoke-RestMethod -Uri "http://localhost:11434/api/tags" `
             -TimeoutSec 5 -ErrorAction Stop | Out-Null
@@ -545,42 +460,32 @@ foreach ($q in $questions) {
             -ForegroundColor Yellow
         Start-Sleep -Seconds 30
     }
-
     Start-Sleep -Seconds $SleepBetween
 }
-
-# ---- Footer in consolidated MD --------------------------------------------
+# ---- Rodape no MD consolidado ---------------------------------------------
 $totalEnd = Get-Date
 $totalMin = [math]::Round(($totalEnd - $totalStart).TotalMinutes, 1)
 $finishedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-
 # Resumo agregado dos sinais A6 (lido do manifest)
 $rows = Import-Csv $manifest
 $nCite    = ($rows | Where-Object { $_.cites_source -eq 'yes' }).Count
 $nAbstain = ($rows | Where-Object { $_.abstained   -eq 'yes' }).Count
 $nTotal   = $rows.Count
-
 $mdFooter = @"
-
 ---
-
 **Run complete.** $nTotal questions in $totalMin minutes.
 Finished at $finishedAt.
-
 ## Sinais agregados do A6
-
 - Respostas com citacao de fonte: $nCite / $nTotal
 - Respostas com abstencao fundamentada: $nAbstain / $nTotal
 - Persona A6 (system prompt): $personaState
-
 > Nota: ``cites_source`` e ``abstained`` sao heuristicas sobre o texto (presenca
 > de referencia / linguagem de abstencao), uteis para triagem. A exatidao das
 > citacoes e a correcao da abstencao devem ser confirmadas na revisao humana,
 > contra as fontes recuperadas registadas em cada bloco.
 "@
 Add-Content -Path $consolidated -Value $mdFooter -Encoding utf8
-
-# ---- Plain-text report: aggregate + close ---------------------------------
+# ---- Relatorio em texto simples: agregado + fecho -------------------------
 if ($writeTxt) {
     $ftr = New-Object System.Text.StringBuilder
     [void]$ftr.AppendLine("")
@@ -596,7 +501,6 @@ if ($writeTxt) {
     [void]$ftr.AppendLine("citacoes e a correcao da abstencao confirmam-se contra as fontes recuperadas.")
     Add-Content -Path $txtReport -Value $ftr.ToString() -Encoding utf8
 }
-
 Write-Host ""
 Write-Host "[done] $nTotal questions in $totalMin minutes." `
     -ForegroundColor Green
