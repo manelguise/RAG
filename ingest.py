@@ -1,61 +1,21 @@
-﻿"""
-=============================================================================
-scripts/ingest.py — Incremental PDF ingestor v3.0
-=============================================================================
+"""
+scripts/ingest.py — Ingestor incremental de PDF.
 
-WHAT'S NEW vs v2.1
-------------------
- I. STRUCTURE-AWARE CHUNKING (chunk_by_structure)
-    Legislation is split by article ("Artigo N.º"), annex and chapter
-    headers; technical norms and operator manuals are split by numbered
-    clause ("4", "4.1", "4.1.2 <title>"). Each structural unit is kept
-    whole when it fits the embedding budget, and only sub-split with the
-    sentence splitter when it exceeds it. Documents with no detectable
-    structure (literature, scanned reports) fall back to the previous
-    fixed-size sentence splitter (512 / 64). Every chunk now carries a
-    `structural_label` metadata field (e.g. "Artigo 5.º") usable as a
-    precise citation anchor, plus a `chunking` field recording the
-    strategy actually used. Tunable via the regexes and MIN_* constants
-    below, and switchable with --chunking {structure,fixed}.
+Ingere dois corpora em duas coleções Qdrant distintas: o corpus público
+(legislação, normas, manuais) em "kb" e o dossiê confidencial do projeto em
+"kb_project". A segmentação é sensível à estrutura: a legislação é dividida por
+artigo/anexo/capítulo e as normas e manuais por cláusula numerada; cada unidade
+estrutural é mantida inteira desde que caiba no orçamento de embedding, sendo
+apenas subdividida quando o excede. Documentos sem estrutura detetável recorrem
+ao segmentador de frases de tamanho fixo.
 
-II. DUAL COLLECTION (public reference corpus + confidential dossier)
-    Two corpora are ingested into two separate Qdrant collections:
-      - docs_full     -> collection "kb"         (public: laws, norms, manuals)
-      - docs_project  -> collection "kb_project" (confidential project dossier)
-    Each corpus keeps its own files; the shared state JSON records the
-    target collection per file. The confidential collection is meant to
-    stay local. Folders that do not exist are simply skipped.
-
-III. --force-rechunk re-processes files even if the stored hash matches,
-     needed after changing the chunking strategy (the per-hash anti-dup
-     wipe makes the re-chunk clean, with no duplicate vectors).
-
-Everything from v2.x is preserved: incremental ingest by stable hash,
-OCR fallback, encoding repair, cross-page continuity (in fixed mode),
-payload indexes, anti-duplication failsafes, orphan scan, exponential
-backoff and the failure taxonomy.
-
-STATUS TAXONOMY
----------------
-    completed_native / completed_mixed / completed_ocr
-    low_yield / no_text
-    failed_recoverable / failed_content
-    skipped_unchanged
-
-CLI
----
-    python scripts\\ingest.py
-    python scripts\\ingest.py --docs-public docs_full --docs-project docs_project
-    python scripts\\ingest.py --chunking fixed          # old behaviour
-    python scripts\\ingest.py --force-rechunk            # re-chunk everything
-    python scripts\\ingest.py --reset                    # asks for YES
-    python scripts\\ingest.py --dry-run
-    python scripts\\ingest.py --only-failed-recoverable
-=============================================================================
+A ingestão é incremental por hash estável, com fallback de OCR, reparação de
+codificação, continuidade entre páginas (no modo fixo), índices de payload,
+salvaguardas anti-duplicação, varrimento de órfãos e backoff exponencial.
 """
 
 # =============================================================================
-# IMPORTS
+# IMPORTAÇÕES
 # =============================================================================
 import os, sys, re, time, json, hashlib, argparse, warnings, logging, gc, bisect
 import datetime as dt
@@ -90,11 +50,11 @@ from qdrant_client.http.exceptions import ResponseHandlingException
 
 
 # =============================================================================
-# CONFIG
+# CONFIGURAÇÃO
 # =============================================================================
-# --- Two corpora -> two collections --------------------------------------
-DOCS_PUBLIC          = "docs_full"        # public: legislation, norms, manuals
-DOCS_PROJECT         = "docs_project"     # confidential: project dossier
+# --- Dois corpora -> duas coleções ---------------------------------------
+DOCS_PUBLIC          = "docs_full"        # público: legislação, normas, manuais
+DOCS_PROJECT         = "docs_project"     # confidencial: dossiê do projeto
 COLLECTION_PUBLIC    = "kb"
 COLLECTION_PROJECT   = "kb_project"
 
@@ -105,22 +65,24 @@ EMBED_BATCH_SIZE     = 8
 INSERT_BATCH_CHUNKS  = 512
 
 # --- Chunking -------------------------------------------------------------
-# The sentence splitter is used (a) as the whole-document fallback when no
-# structure is detected, and (b) to sub-split any structural unit that is
-# larger than CHUNK_SIZE tokens. Structural units below this size are kept
-# intact, which is the whole point of structure-aware chunking.
-CHUNK_SIZE           = 512        # tokens (sentence splitter target)
+# O segmentador de frases é usado (a) como fallback para o documento inteiro
+# quando não se deteta estrutura e (b) para subdividir qualquer unidade
+# estrutural maior do que CHUNK_SIZE tokens. As unidades estruturais abaixo
+# deste tamanho são mantidas intactas, que é todo o propósito da segmentação
+# sensível à estrutura.
+CHUNK_SIZE           = 512        # tokens (alvo do segmentador de frases)
 CHUNK_OVERLAP        = 64         # tokens
-MIN_STRUCT_UNITS     = 3          # need at least this many boundaries to
-                                  # treat a document as "structured"
-MIN_UNIT_CHARS       = 200        # structural units smaller than this (e.g. a
-                                  # lone header line) are merged into the next
+MIN_STRUCT_UNITS     = 3          # nº mínimo de fronteiras para tratar um
+                                  # documento como "estruturado"
+MIN_UNIT_CHARS       = 200        # unidades estruturais menores do que isto (ex.
+                                  # uma linha de cabeçalho isolada) são fundidas
+                                  # com a seguinte
 
 OCR_DPI                 = 200
 NATIVE_PAGE_MIN_CHARS   = 200
 USEFUL_TOTAL_MIN        = 500
 OCR_THRESHOLD_RATIO     = 0.5
-PAGE_OVERLAP_CHARS      = 500     # cross-page soft continuity (fixed mode only)
+PAGE_OVERLAP_CHARS      = 500     # continuidade suave entre páginas (só no modo fixo)
 ENCODING_HEALTH_THRESH  = 0.10
 
 BACKOFF_MAX_RETRIES     = 5
@@ -138,7 +100,7 @@ DEFAULT_SKIP            = set()
 
 
 # =============================================================================
-# LOGGING SETUP
+# CONFIGURAÇÃO DE LOGGING
 # =============================================================================
 def setup_logging(verbose: bool = False) -> logging.Logger:
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -163,7 +125,7 @@ log = setup_logging()
 
 
 # =============================================================================
-# ENCODING REPAIRS
+# REPARAÇÃO DE CODIFICAÇÃO
 # =============================================================================
 ENCODING_FIXES = [
     ('\u221eC',   '\u00b0C'), ('\u221eF',   '\u00b0F'), ('\u221e ',   '\u00b0'),
@@ -201,7 +163,7 @@ def encoding_health(text: str) -> float:
 
 
 # =============================================================================
-# STABLE HASH
+# HASH ESTÁVEL
 # =============================================================================
 def stable_hash(path: Path) -> str:
     h = hashlib.sha256()
@@ -226,7 +188,7 @@ def stable_hash(path: Path) -> str:
 
 
 # =============================================================================
-# STATE MANAGEMENT
+# GESTÃO DE ESTADO
 # =============================================================================
 def load_state() -> dict:
     if STATE_FILE.exists():
@@ -278,7 +240,7 @@ def with_backoff(fn, *args, label: str = "operation", **kwargs):
 
 
 # =============================================================================
-# PDF EXTRACTION
+# EXTRAÇÃO DE PDF
 # =============================================================================
 _OCR_ENGINE = None
 
@@ -304,7 +266,7 @@ def _ocr_one_page(page) -> str:
 
 
 def extract_pdf_pages(path: Path):
-    """Generator yielding (page_index, text, used_ocr) per page."""
+    """Gerador que produz (índice_página, texto, usou_ocr) por cada página."""
     with fitz.open(str(path)) as pdf:
         for i, page in enumerate(pdf):
             native_text = page.get_text("text") or ""
@@ -326,11 +288,12 @@ def extract_pdf_pages(path: Path):
 
 def extract_document(path: Path, stats: dict):
     """
-    Read a file into one continuous text, accumulating page/char stats.
+    Lê um ficheiro para um único texto contínuo, acumulando estatísticas de
+    páginas/carateres.
 
-    Returns (full_text, page_starts) where page_starts is a sorted list of
-    (char_offset, page_number) marking where each page begins inside
-    full_text. Used to attach an approximate page label to every chunk.
+    Devolve (full_text, page_starts), onde page_starts é uma lista ordenada de
+    (offset, número_da_página) que marca onde cada página começa dentro de
+    full_text. Serve para atribuir um rótulo de página aproximado a cada chunk.
     """
     parts, page_starts, offset = [], [], 0
     suffix = path.suffix.lower()
@@ -349,7 +312,7 @@ def extract_document(path: Path, stats: dict):
             stats["ocr_pages" if used_ocr else "native_pages"] += 1
             page_starts.append((offset, page_num))
             parts.append(text)
-            offset += len(text) + 1            # +1 for the "\n" join below
+            offset += len(text) + 1            # +1 para o "\n" da junção abaixo
     elif suffix in {".md", ".txt"}:
         text = fix_encoding(path.read_text(encoding='utf-8', errors='ignore'))
         if text.strip():
@@ -364,7 +327,7 @@ def extract_document(path: Path, stats: dict):
 
 
 def page_for_offset(offset: int, page_starts) -> int:
-    """Return the page number whose span contains `offset`."""
+    """Devolve o número da página cujo intervalo contém `offset`."""
     if not page_starts:
         return 1
     keys = [o for o, _ in page_starts]
@@ -374,15 +337,14 @@ def page_for_offset(offset: int, page_starts) -> int:
 
 
 # =============================================================================
-# STRUCTURE-AWARE CHUNKING
+# SEGMENTAÇÃO SENSÍVEL À ESTRUTURA
 # =============================================================================
-# Boundary patterns. Tuned for Portuguese legal text and generic clause
-# numbering; verify the per-document "chunking=" logs on your corpus and
-# adjust if a family of documents is not being detected.
+# Padrões de fronteira. Afinados para texto legislativo português e numeração
+# de cláusulas genérica; verificar os logs "chunking=" por documento no corpus
+# e ajustar se uma família de documentos não estiver a ser detetada.
 #
-#   LEGIS_RE  — "Artigo 5.º", "Artigo 12.º-A", plus ANEXO/CAPÍTULO/SECÇÃO/TÍTULO
-#   CLAUSE_RE — "4 Scope", "4.1 ...", "4.1.2 ..." at line start (IEC/IEEE, manuals)
-# =============================================================================
+#   LEGIS_RE  — "Artigo 5.º", "Artigo 12.º-A", e ANEXO/CAPÍTULO/SECÇÃO/TÍTULO
+#   CLAUSE_RE — "4 Scope", "4.1 ...", "4.1.2 ..." no início de linha (IEC/IEEE, manuais)
 LEGIS_RE = re.compile(
     r'(?m)^[ \t]*(?:'
     r'Artigo[ \t]+\d+\.?[\u00ba\u00b0]?(?:[-\u2013][A-Za-z])?'
@@ -408,16 +370,17 @@ def _classifier_hint(source_type: str) -> str:
 
 def choose_strategy(source_type: str, text: str) -> str:
     """
-    Decide the chunking strategy from the classifier hint, confirmed (or
-    rescued, when the hint is 'fallback') by the structure actually present
-    in the text. Returns one of: legislation, norm, manual, fallback.
+    Decide a estratégia de segmentação a partir da pista do classificador,
+    confirmada (ou recuperada, quando a pista é 'fallback') pela estrutura
+    efetivamente presente no texto. Devolve um de: legislation, norm, manual,
+    fallback.
     """
     hint = _classifier_hint(source_type)
     if hint == "legislation" and len(LEGIS_RE.findall(text)) >= MIN_STRUCT_UNITS:
         return "legislation"
     if hint in ("norm", "manual") and len(CLAUSE_RE.findall(text)) >= MIN_STRUCT_UNITS:
         return hint
-    # Hint missing or not confirmed by content: detect from the text itself.
+    # Pista ausente ou não confirmada pelo conteúdo: detetar a partir do próprio texto.
     if len(LEGIS_RE.findall(text)) >= MIN_STRUCT_UNITS:
         return "legislation"
     if len(CLAUSE_RE.findall(text)) >= MIN_STRUCT_UNITS:
@@ -427,15 +390,16 @@ def choose_strategy(source_type: str, text: str) -> str:
 
 def _split_on_boundaries(text: str, pattern):
     """
-    Cut `text` at every line that matches `pattern`. Returns a list of
-    (label, segment, start_offset), or None if fewer than MIN_STRUCT_UNITS
-    boundaries are found. The matched header line becomes the segment label.
+    Corta `text` em cada linha que corresponde a `pattern`. Devolve uma lista de
+    (label, segmento, offset_inicial), ou None se forem encontradas menos de
+    MIN_STRUCT_UNITS fronteiras. A linha de cabeçalho encontrada torna-se o
+    rótulo do segmento.
     """
     matches = list(pattern.finditer(text))
     if len(matches) < MIN_STRUCT_UNITS:
         return None
     units = []
-    if matches[0].start() > MIN_UNIT_CHARS:        # substantial preamble
+    if matches[0].start() > MIN_UNIT_CHARS:        # preâmbulo substancial
         units.append((None, text[:matches[0].start()], 0))
     for i, m in enumerate(matches):
         start = m.start()
@@ -446,8 +410,9 @@ def _split_on_boundaries(text: str, pattern):
 
 
 def _merge_small_units(units):
-    """Carry a too-short unit (typically a lone header line) forward and
-    prepend it to the next unit, keeping the header as that unit's label."""
+    """Transporta uma unidade demasiado curta (tipicamente uma linha de
+    cabeçalho isolada) para a frente e antepõe-na à unidade seguinte, mantendo
+    o cabeçalho como rótulo dessa unidade."""
     out, carry = [], None
     for label, seg, off in units:
         if carry is not None:
@@ -472,14 +437,14 @@ def _merge_small_units(units):
 def chunk_by_structure(full_text: str, source_type: str,
                        splitter: SentenceSplitter, mode: str):
     """
-    Split `full_text` into (label, chunk_text, start_offset) tuples.
+    Divide `full_text` em tuplos (label, texto_chunk, offset_inicial).
 
-    mode == 'fixed'      -> always the sentence splitter (legacy behaviour)
-    mode == 'structure'  -> split by article/clause; units larger than
-                            CHUNK_SIZE are sub-split by the sentence splitter;
-                            unstructured documents fall back to 'fixed'.
+    mode == 'fixed'      -> sempre o segmentador de frases (comportamento antigo)
+    mode == 'structure'  -> divide por artigo/cláusula; as unidades maiores do
+                            que CHUNK_SIZE são subdivididas pelo segmentador de
+                            frases; os documentos sem estrutura recorrem a 'fixed'.
 
-    Also returns the strategy label actually used.
+    Devolve também o rótulo da estratégia efetivamente usada.
     """
     if mode == "fixed":
         chunks = [(None, t, o)
@@ -506,7 +471,7 @@ def chunk_by_structure(full_text: str, source_type: str,
         if len(subs) <= 1:
             out.append((label, seg.strip(), off))
         else:
-            # Re-locate sub-chunks inside the unit, mapping back to full_text.
+            # Relocalizar os sub-chunks dentro da unidade, mapeando de volta para full_text.
             for sub, rel in _locate_chunks(subs, seg):
                 out.append((label, sub, off + rel))
     return strategy, out
@@ -514,10 +479,11 @@ def chunk_by_structure(full_text: str, source_type: str,
 
 def _locate_chunks(chunks, haystack):
     """
-    Attach a start offset to each chunk by locating it in `haystack` with a
-    forward-moving cursor (chunks come out in order). Returns list of
-    (chunk_text, start_offset). Robust to minor whitespace normalisation
-    because it searches on a stripped prefix of the chunk.
+    Atribui um offset inicial a cada chunk, localizando-o em `haystack` com um
+    cursor que avança (os chunks saem por ordem). Devolve uma lista de
+    (texto_chunk, offset_inicial). Resistente a pequenas normalizações de
+    espaços em branco porque procura sobre um prefixo do chunk sem espaços nas
+    pontas.
     """
     located, cursor = [], 0
     for c in chunks:
@@ -527,7 +493,7 @@ def _locate_chunks(chunks, haystack):
         probe = c[:60].strip()
         pos = haystack.find(probe, cursor)
         if pos < 0:
-            pos = haystack.find(probe)        # fall back to global search
+            pos = haystack.find(probe)        # recorre a procura global
         if pos < 0:
             pos = cursor
         located.append((c, pos))
@@ -536,7 +502,7 @@ def _locate_chunks(chunks, haystack):
 
 
 # =============================================================================
-# NODE BUILDING
+# CONSTRUÇÃO DE NÓS
 # =============================================================================
 EXCLUDED_EMBED_KEYS = [
     "doc_id", "ingested_at", "file_path", "classification_confidence",
@@ -550,7 +516,7 @@ EXCLUDED_LLM_KEYS = [
 def build_nodes_for_file(path: Path, classification: dict, doc_id: str,
                          corpus: str, full_text: str, page_starts,
                          splitter: SentenceSplitter, mode: str, stats: dict):
-    """Yield TextNodes for one file, one per structure-aware chunk."""
+    """Produz TextNodes para um ficheiro, um por cada chunk sensível à estrutura."""
     base_meta = {
         "source":       str(path),
         "file_name":    path.name,
@@ -581,7 +547,7 @@ def build_nodes_for_file(path: Path, classification: dict, doc_id: str,
 
 
 # =============================================================================
-# STATUS DETERMINATION
+# DETERMINAÇÃO DE ESTADO
 # =============================================================================
 def determine_status(stats: dict) -> str:
     total_pages = stats["native_pages"] + stats["ocr_pages"]
@@ -598,7 +564,7 @@ def determine_status(stats: dict) -> str:
 
 
 # =============================================================================
-# PAYLOAD INDEXES
+# ÍNDICES DE PAYLOAD
 # =============================================================================
 def ensure_payload_indexes(client: QdrantClient, collection: str):
     if not client.collection_exists(collection):
@@ -621,7 +587,7 @@ def ensure_payload_indexes(client: QdrantClient, collection: str):
 
 
 # =============================================================================
-# ANTI-DUPLICATION FAILSAFES
+# SALVAGUARDAS ANTI-DUPLICAÇÃO
 # =============================================================================
 from qdrant_client.http import models as qm  # noqa: E402
 
@@ -706,7 +672,7 @@ def prompt_orphan_cleanup(client: QdrantClient, collection: str,
 
 
 # =============================================================================
-# INSERT WITH BACKOFF
+# INSERÇÃO COM BACKOFF
 # =============================================================================
 def safe_insert(index, batch, file_label: str):
     return with_backoff(index.insert_nodes, batch,
@@ -714,7 +680,7 @@ def safe_insert(index, batch, file_label: str):
 
 
 # =============================================================================
-# INGEST ONE FILE (into a given collection/index)
+# INGESTÃO DE UM FICHEIRO (numa dada coleção/índice)
 # =============================================================================
 def ingest_file(path: Path, index, splitter, state: dict, args,
                 client: QdrantClient, collection: str, corpus: str):
@@ -745,7 +711,7 @@ def ingest_file(path: Path, index, splitter, state: dict, args,
         return None
 
     try:
-        # 1) Extract whole-document text + page map.
+        # 1) Extrair o texto do documento inteiro + mapa de páginas.
         full_text, page_starts = extract_document(path, stats)
         if not full_text.strip():
             status = "no_text"
@@ -756,7 +722,7 @@ def ingest_file(path: Path, index, splitter, state: dict, args,
             log.info(f"   {status}")
             return status
 
-        # 2) Classify (filename first, refine from content if unknown).
+        # 2) Classificar (primeiro pelo nome do ficheiro, refinar pelo conteúdo se desconhecido).
         classification = classify_source(path.name, "")
         if classification["source_type"] == "unknown":
             better = classify_source(path.name, full_text[:4000])
@@ -765,7 +731,7 @@ def ingest_file(path: Path, index, splitter, state: dict, args,
                 log.info(f"   classification refined from content: "
                          f"{better['source_type']}/{better['jurisdiction']}")
 
-        # 3) Structure-aware chunk + 4) build nodes, inserting in batches.
+        # 3) Segmentação sensível à estrutura + 4) construir nós, inserindo em lotes.
         batch = []
         for node in build_nodes_for_file(path, classification, digest, corpus,
                                          full_text, page_starts, splitter,
@@ -813,7 +779,7 @@ def ingest_file(path: Path, index, splitter, state: dict, args,
 
 
 # =============================================================================
-# PRE-FLIGHT
+# VERIFICAÇÕES PRÉVIAS
 # =============================================================================
 def preflight() -> bool:
     import urllib.request, urllib.error
@@ -843,12 +809,12 @@ def preflight() -> bool:
 def parse_args():
     p = argparse.ArgumentParser(description="Incremental ingestor v3 "
                                 "(structure-aware chunking, dual collection).")
-    # Backward-compatible single-corpus aliases:
+    # Aliases de corpus único, compatíveis com versões anteriores:
     p.add_argument("--docs", default=None,
                    help="Alias for --docs-public (back-compat)")
     p.add_argument("--collection", default=None,
                    help="Alias for --collection-public (back-compat)")
-    # Dual-corpus:
+    # Corpus duplo:
     p.add_argument("--docs-public", default=DOCS_PUBLIC)
     p.add_argument("--docs-project", default=DOCS_PROJECT)
     p.add_argument("--collection-public", default=COLLECTION_PUBLIC)
@@ -861,7 +827,7 @@ def parse_args():
     p.add_argument("--force-rechunk", action="store_true",
                    help="Reprocess files even if hash unchanged "
                         "(needed after changing --chunking)")
-    # Operational:
+    # Operacionais:
     p.add_argument("--reset", action="store_true",
                    help="Drop BOTH collections and wipe state (asks for YES)")
     p.add_argument("--dry-run", action="store_true")
@@ -875,7 +841,7 @@ def parse_args():
     p.add_argument("--skip-orphan-scan", action="store_true")
     p.add_argument("--auto-clean-orphans", action="store_true")
     args = p.parse_args()
-    # Resolve aliases.
+    # Resolver aliases.
     if args.docs:
         args.docs_public = args.docs
     if args.collection:
@@ -895,7 +861,7 @@ def confirm_reset(collections) -> bool:
 
 
 # =============================================================================
-# PROCESS ONE CORPUS
+# PROCESSAR UM CORPUS
 # =============================================================================
 def process_corpus(corpus_name: str, docs_dir: Path, collection: str,
                    client: QdrantClient, splitter, state: dict, args,
@@ -920,7 +886,7 @@ def process_corpus(corpus_name: str, docs_dir: Path, collection: str,
     if skip_names:
         files = [f for f in files if f.name not in skip_names]
 
-    # Orphan scan (per collection).
+    # Varrimento de órfãos (por coleção).
     if (not args.skip_orphan_scan and not args.dry_run
             and client.collection_exists(collection)):
         log.info(f"[{collection}] scanning for orphan chunks...")
@@ -931,7 +897,7 @@ def process_corpus(corpus_name: str, docs_dir: Path, collection: str,
         else:
             log.info(f"[{collection}] no orphans found.")
 
-    # --only-failed filters.
+    # Filtros --only-failed.
     def st(f):
         return state.get(str(f), {}).get("status", "")
     if args.only_failed:
